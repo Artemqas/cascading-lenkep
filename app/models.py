@@ -32,6 +32,8 @@ class Payment(Base):
     idempotency_key: Mapped[str] = mapped_column(unique=True)
     idempotency_payload_hash: Mapped[str]
     callback_url: Mapped[str]
+    # provider_id -> mock scenario string, for deterministic demo/test behavior; unused in production.
+    provider_scenarios: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)
 

@@ -4,12 +4,13 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+import app.db as db_module
 from app.db import Base, get_session
 from app.main import app
 
 
 @pytest_asyncio.fixture
-async def db_session():
+async def db_session(monkeypatch):
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -19,6 +20,11 @@ async def db_session():
         await conn.run_sync(Base.metadata.create_all)
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    # Background tasks (e.g. the cascade) look up app.db.session_factory at call
+    # time, not via get_session — point that at this test's engine too, so they
+    # never reach the real (unavailable-in-tests) Postgres engine.
+    monkeypatch.setattr(db_module, "session_factory", session_factory)
+
     async with session_factory() as session:
         yield session
 

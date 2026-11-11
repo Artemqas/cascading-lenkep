@@ -7,6 +7,7 @@ from sqlalchemy.pool import StaticPool
 import app.db as db_module
 from app.db import Base, get_session
 from app.main import app
+from app.models import Provider
 
 
 @pytest_asyncio.fixture
@@ -43,3 +44,34 @@ async def client(db_session):
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
     app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def seed_providers(db_session):
+    """Seeds the three mock providers, each with no manual priority (adaptive by
+    default). Opt-in per test (not autouse) so other test files' own Provider
+    seeding (e.g. with ids "a"/"b") never collides with these ids."""
+    providers = [
+        Provider(
+            id="fast_sync", name="fast_sync", priority=None,
+            supported_directions=["deposit", "withdraw"],
+            supported_card_types=["visa", "mastercard", "other"],
+            min_amount=0, max_amount=1_000_000, enabled=True,
+        ),
+        Provider(
+            id="webhook_async", name="webhook_async", priority=None,
+            supported_directions=["deposit", "withdraw"],
+            supported_card_types=["visa", "mastercard", "other"],
+            min_amount=0, max_amount=1_000_000, enabled=True,
+        ),
+        Provider(
+            id="flaky", name="flaky", priority=None,
+            supported_directions=["deposit", "withdraw"],
+            supported_card_types=["visa", "mastercard", "other"],
+            min_amount=0, max_amount=1_000_000, enabled=True,
+        ),
+    ]
+    for provider in providers:
+        db_session.add(provider)
+    await db_session.commit()
+    return providers

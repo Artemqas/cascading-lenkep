@@ -54,6 +54,7 @@ async def create_payment(
             idempotency_key=idempotency_key,
             idempotency_payload_hash=payload_hash,
             callback_url=request.callback_url,
+            provider_scenarios=request.provider_scenarios,
         )
 
     try:
@@ -89,6 +90,7 @@ async def get_payment(payment_id: str, session: AsyncSession = Depends(get_sessi
         **_to_payment_response(payment).model_dump(),
         attempts=[
             AttemptResponse(
+                id=str(a.id),
                 provider_id=a.provider_id,
                 status=a.status,
                 decline_code=a.decline_code,

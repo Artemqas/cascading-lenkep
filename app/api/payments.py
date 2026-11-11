@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
@@ -14,7 +15,29 @@ from app.idempotency import IdempotencyConflict, get_or_create_payment
 from app.models import Payment, ProviderAttempt
 from app.schemas import AttemptResponse, PaymentCreateRequest, PaymentDetailResponse, PaymentResponse
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+# Holds a strong reference to every scheduled cascade task so it can't be
+# garbage-collected mid-flight, and so a failure that somehow escapes
+# run_cascade's own handling still gets logged instead of silently vanishing.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_cascade(payment_id: str) -> None:
+    task = asyncio.create_task(_run_cascade_background(payment_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_on_cascade_task_done)
+
+
+def _on_cascade_task_done(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("background cascade task failed", exc_info=exc)
 
 
 def _to_payment_response(payment: Payment) -> PaymentResponse:
@@ -53,7 +76,7 @@ async def create_payment(
             card_type=request.card_type,
             idempotency_key=idempotency_key,
             idempotency_payload_hash=payload_hash,
-            callback_url=request.callback_url,
+            callback_url=str(request.callback_url),
             provider_scenarios=request.provider_scenarios,
         )
 
@@ -63,7 +86,7 @@ async def create_payment(
         raise HTTPException(status_code=409, detail="Idempotency-Key reused with a different payload") from exc
 
     if created:
-        asyncio.create_task(_run_cascade_background(str(payment.id)))
+        _schedule_cascade(str(payment.id))
     else:
         response.status_code = 200
 

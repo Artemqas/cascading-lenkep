@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -6,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import webhooks as webhooks_module
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.enums import AttemptStatus, PaymentStatus
 from app.models import Payment, ProviderAttempt, ReconciliationFlag
 from app.providers.base import AttemptOutcome, OutcomeKind, ProviderAttemptRequest
@@ -15,6 +16,8 @@ from app.reconciliation import resolve_ambiguous
 from app.routing import order_providers
 from app.stats import correct_result, record_result
 from app.webhooks import send_merchant_webhook
+
+logger = logging.getLogger(__name__)
 
 
 def _build_request(attempt: ProviderAttempt, payment: Payment) -> ProviderAttemptRequest:
@@ -33,11 +36,27 @@ async def run_cascade(session: AsyncSession, payment_id: str) -> None:
     payment = await session.get(Payment, uuid.UUID(payment_id))
     settings = get_settings()
 
+    payment.status = PaymentStatus.PROCESSING
+    await session.commit()
+
+    attempts: list[ProviderAttempt] = []
+    try:
+        await _run_cascade_loop(session, payment, settings, attempts)
+    except Exception:
+        # An unexpected error (adapter bug, DB hiccup, etc.) must not leave the
+        # payment stuck PROCESSING forever with no merchant notification — treat
+        # it as a failure, but make it loud so it's diagnosable.
+        logger.exception("run_cascade failed unexpectedly for payment %s", payment_id)
+        await session.rollback()
+        await finalize_failed(session, payment, attempts)
+
+
+async def _run_cascade_loop(
+    session: AsyncSession, payment: Payment, settings: Settings, attempts: list[ProviderAttempt]
+) -> None:
     candidates = await eligible_providers(session, payment.direction, payment.card_type, payment.amount)
     ordered = await order_providers(session, candidates, payment.direction, payment.card_type)
     ordered = ordered[: settings.max_cascade_attempts]
-
-    attempts: list[ProviderAttempt] = []
 
     for provider in ordered:
         adapter = get_adapter(provider.id)
@@ -56,9 +75,11 @@ async def run_cascade(session: AsyncSession, payment_id: str) -> None:
         try:
             outcome = await adapter.submit(request)
         except asyncio.TimeoutError:
-            outcome = AttemptOutcome(kind=OutcomeKind.AMBIGUOUS)
+            outcome = AttemptOutcome(kind=OutcomeKind.AMBIGUOUS, provider_reference=str(attempt.id))
 
         if outcome.kind == OutcomeKind.AMBIGUOUS:
+            attempt.status = AttemptStatus.AMBIGUOUS
+            await session.commit()
             resolved = await resolve_ambiguous(
                 str(attempt.id), outcome.provider_reference, adapter, settings.reconciliation_deadline_seconds
             )
@@ -96,12 +117,21 @@ async def run_cascade(session: AsyncSession, payment_id: str) -> None:
 
 
 async def finalize_success(session: AsyncSession, payment: Payment, attempt: ProviderAttempt) -> None:
+    await session.refresh(payment)
+    if payment.status == PaymentStatus.CONFLICT:
+        # A late webhook already flagged a conflict on this payment (processed on
+        # a different session) while this cascade was still in flight — don't
+        # clobber that with a finalization decided before the conflict existed.
+        return
     payment.status = PaymentStatus.SUCCEEDED
     await session.commit()
     await send_merchant_webhook(payment, "payment.succeeded")
 
 
 async def finalize_failed(session: AsyncSession, payment: Payment, attempts: list[ProviderAttempt]) -> None:
+    await session.refresh(payment)
+    if payment.status == PaymentStatus.CONFLICT:
+        return
     payment.status = PaymentStatus.FAILED
     await session.commit()
     reasons = [a.decline_code for a in attempts if a.decline_code]
@@ -124,18 +154,16 @@ async def handle_late_resolution(
             ProviderAttempt.status == AttemptStatus.SUCCEEDED,
         )
     )
-    succeeded_attempt = result.scalar_one_or_none()
+    succeeded_attempts = result.scalars().all()
 
-    if succeeded_attempt is not None and succeeded_attempt.id == attempt.id:
-        return  # duplicate webhook delivery for the attempt that already succeeded
+    if any(a.id == attempt.id for a in succeeded_attempts):
+        return  # duplicate webhook delivery for an attempt that already succeeded
 
-    # Either nothing succeeded yet (payment was finalized FAILED) or a *different*
-    # attempt succeeded — either way this late SUCCESS contradicts what the cascade
-    # already finalized.
+    # This attempt isn't among the succeeded ones — either nothing has succeeded
+    # yet (payment was finalized FAILED) or a *different* attempt succeeded.
+    # Either way this late SUCCESS contradicts what the cascade already finalized.
     payment.status = PaymentStatus.CONFLICT
-    attempt_ids = [str(attempt.id)]
-    if succeeded_attempt is not None:
-        attempt_ids.append(str(succeeded_attempt.id))
+    attempt_ids = [str(attempt.id)] + [str(a.id) for a in succeeded_attempts]
     flag = ReconciliationFlag(
         id=uuid.uuid4(),
         payment_id=payment.id,

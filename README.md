@@ -68,6 +68,7 @@ flowchart TD
 docker-compose up -d          # postgres on localhost:5432
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/alembic upgrade head
+.venv/bin/python scripts/seed_providers.py   # inserts the 3 mock providers
 .venv/bin/uvicorn app.main:app --reload
 ```
 
@@ -84,9 +85,9 @@ Postgres, so no running database is required:
 ## Demoing each corner case
 
 All of these are implemented as automated tests in `tests/test_corner_cases.py`;
-the curl examples below assume a running server with providers seeded (the test
-suite seeds them in-memory via the `seed_providers` fixture — for a live demo,
-insert the same three `Provider` rows via a one-off script or `psql`).
+the curl examples below assume a running server with providers seeded via
+`scripts/seed_providers.py` (the test suite seeds them separately, in-memory,
+via the `seed_providers` fixture).
 
 **Manual priority overrides adaptive history** — a provider with a long success
 history still loses to a manually-prioritized provider:
@@ -172,10 +173,19 @@ curl -X POST localhost:8000/payments \
 
 - **No external task broker.** The cascade runs as an in-process `asyncio` task,
   not a Celery/RQ job. If the process restarts mid-cascade, that payment is stuck
-  `pending` forever — there's no crash recovery. In production this would be a
-  durable queue (Celery/RQ + Redis, or Postgres-backed job table with a poller).
-- **No auth.** There's no API key / merchant identity on requests. Every payment
-  belongs to a single implicit merchant (see below).
+  `pending`/`processing` forever — there's no crash recovery (an unexpected error
+  *within* a running cascade is handled — it finalizes the payment as `failed`
+  and logs — but a killed process loses the in-flight task entirely). In
+  production this would be a durable queue (Celery/RQ + Redis, or a
+  Postgres-backed job table with a poller that can resume orphaned payments).
+- **No auth on the API, and the provider webhook endpoint specifically trusts its
+  caller.** There's no API key / merchant identity on `POST`/`GET /payments`
+  (every payment belongs to a single implicit merchant, see below), and
+  `POST /webhooks/providers/{id}` has no signature verification either — anything
+  that can reach it can address any `attempt_id` and flip a finalized payment to
+  `conflict`, or bump a provider's adaptive-routing stats. A real deployment would
+  need per-provider webhook secrets (HMAC, mirroring what this gateway already
+  does for its *outgoing* merchant webhook) before this endpoint is internet-facing.
 - **No multi-tenancy.** The schema has no merchant/account concept — one logical
   merchant, one `callback_url` per payment. A real system would scope providers,
   routing rules, and stats per merchant.
@@ -192,3 +202,12 @@ curl -X POST localhost:8000/payments \
 - **Reconciliation deadline is a single global default (10s).** A real system would
   likely tune this per provider (a provider with a known slow settlement window
   needs a longer deadline than one that's normally synchronous).
+- **The merchant webhook's HMAC signature has no timestamp/nonce**, so a captured
+  request is technically replayable. The design only called for "signed"; the
+  merchant side is expected to be idempotent on `(payment_id, status)` regardless,
+  which bounds the damage of a replay to "redundant", not "harmful".
+- **No rate limiting, request size limits, or CORS configuration** — out of scope
+  for this exercise, but real deployment-facing concerns.
+- **`amount` is a bare `int` in minor units** (e.g. cents) with no currency-specific
+  exponent handling — fine for USD, wrong for a currency like JPY (0 decimal
+  places) or BHD (3). A real system would look up the exponent per ISO 4217 code.

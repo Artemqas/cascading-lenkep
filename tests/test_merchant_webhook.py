@@ -38,3 +38,21 @@ async def test_send_merchant_webhook_retries_on_failure(respx_mock):
     payment = make_payment(callback_url="https://merchant.test/cb", status=PaymentStatus.FAILED)
     await send_merchant_webhook(payment, "payment.failed")
     assert route.call_count == 2
+
+
+async def test_send_merchant_webhook_retries_on_connection_error(respx_mock):
+    # A ConnectError/ReadTimeout *is* non-delivery — the thing retries exist for —
+    # not just a non-2xx response.
+    route = respx_mock.post("https://merchant.test/cb").mock(
+        side_effect=[httpx.ConnectError("boom"), httpx.Response(200)])
+    payment = make_payment(callback_url="https://merchant.test/cb", status=PaymentStatus.SUCCEEDED)
+    await send_merchant_webhook(payment, "payment.succeeded")  # must not raise
+    assert route.call_count == 2
+
+
+async def test_send_merchant_webhook_gives_up_quietly_after_exhausting_retries(respx_mock, caplog):
+    route = respx_mock.post("https://merchant.test/cb").mock(side_effect=httpx.ConnectError("boom"))
+    payment = make_payment(callback_url="https://merchant.test/cb", status=PaymentStatus.FAILED)
+    await send_merchant_webhook(payment, "payment.failed")  # must not raise
+    assert route.call_count == 4  # 1 initial + 3 retries
+    assert "boom" in caplog.text

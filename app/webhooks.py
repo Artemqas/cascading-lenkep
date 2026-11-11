@@ -2,12 +2,15 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 
 import httpx
 
 from app.config import get_settings
 from app.models import Payment
 from app.providers.base import AttemptOutcome
+
+logger = logging.getLogger(__name__)
 
 _RETRY_DELAYS = (0.1, 0.2, 0.4)
 
@@ -49,16 +52,28 @@ async def send_merchant_webhook(
     signature = hmac.new(secret, raw, hashlib.sha256).hexdigest()
     headers = {"X-Signature": signature, "Content-Type": "application/json"}
 
+    async def _attempt() -> bool:
+        """Returns True on a 2xx delivery, False on a non-2xx response. A
+        connection-level failure (timeout, DNS, refused, ...) *is* non-delivery —
+        the thing retries exist for — so it's treated the same as a bad status,
+        not re-raised."""
+        try:
+            response = await client.post(payment.callback_url, content=raw, headers=headers)
+        except httpx.HTTPError as exc:
+            logger.warning("merchant webhook delivery attempt failed for payment %s: %s",
+                            payment.id, exc)
+            return False
+        return response.status_code < 300
+
     client = http_client or httpx.AsyncClient()
     try:
-        response = await client.post(payment.callback_url, content=raw, headers=headers)
-        if response.status_code < 300:
+        if await _attempt():
             return
         for delay in _RETRY_DELAYS:
             await asyncio.sleep(delay)
-            response = await client.post(payment.callback_url, content=raw, headers=headers)
-            if response.status_code < 300:
+            if await _attempt():
                 return
+        logger.error("merchant webhook delivery exhausted all retries for payment %s", payment.id)
     finally:
         if http_client is None:
             await client.aclose()

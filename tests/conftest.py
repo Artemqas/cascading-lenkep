@@ -8,6 +8,22 @@ import app.db as db_module
 from app.db import Base, get_session
 from app.main import app
 from app.models import Provider
+from app.providers.flaky import FlakyAdapter
+from app.webhooks import event_bus
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_adapter_and_bus_state():
+    """FlakyAdapter.STATUS_RESOLUTIONS is class-level mutable state (by design —
+    it stands in for a real provider's backend), and the webhook event bus is a
+    module-level singleton. Without resetting both between tests, one test's
+    seeded resolution or unresolved waiter leaks into the next and makes its
+    assertions pass or fail for the wrong reason."""
+    FlakyAdapter.STATUS_RESOLUTIONS.clear()
+    event_bus._waiters.clear()
+    yield
+    FlakyAdapter.STATUS_RESOLUTIONS.clear()
+    event_bus._waiters.clear()
 
 
 @pytest_asyncio.fixture

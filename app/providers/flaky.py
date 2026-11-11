@@ -16,7 +16,12 @@ class FlakyAdapter:
         if scenario == "timeout":
             raise asyncio.TimeoutError()
         status_code, body = self._raw_response(scenario)
-        return self._normalize(status_code, body)
+        outcome = self._normalize(status_code, body)
+        if outcome.kind == OutcomeKind.AMBIGUOUS:
+            # Status-check polling looks itself up by this reference later — without
+            # it, check_status(None) can never find a seeded resolution.
+            outcome = AttemptOutcome(kind=OutcomeKind.AMBIGUOUS, provider_reference=request.attempt_id)
+        return outcome
 
     def _raw_response(self, scenario: str) -> tuple[int, dict]:
         if scenario == "http_5xx":

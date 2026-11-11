@@ -16,8 +16,19 @@ router = APIRouter()
 async def receive_provider_webhook(
     provider_id: str, payload: dict, session: AsyncSession = Depends(get_session)
 ) -> dict:
-    adapter = get_adapter(provider_id)
-    resolution = adapter.parse_webhook(payload)
+    # A webhook receiver must never fail the delivery: an unknown provider id, a
+    # malformed body, or a provider that doesn't resolve via webhooks at all are
+    # all just "nothing to do here", not errors — the caller (a real provider)
+    # would otherwise retry forever against an endpoint that can never succeed.
+    try:
+        adapter = get_adapter(provider_id)
+    except KeyError:
+        return {"status": "ok"}
+
+    try:
+        resolution = adapter.parse_webhook(payload)
+    except (KeyError, NotImplementedError):
+        return {"status": "ok"}
 
     if event_bus.resolve(resolution.attempt_id, resolution.outcome):
         return {"status": "ok"}

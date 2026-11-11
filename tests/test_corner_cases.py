@@ -36,7 +36,7 @@ async def _wait_for_terminal_status(client, payment_id, timeout=2.0):
     while True:
         resp = await client.get(f"/payments/{payment_id}")
         body = resp.json()
-        if body["status"] != "pending":
+        if body["status"] not in ("pending", "processing"):
             return body
         if asyncio.get_event_loop().time() >= deadline:
             return body
@@ -179,7 +179,9 @@ async def test_e2e_late_webhook_after_cascade_moved_on_flags_conflict(client, db
         await _set_priority(db_session, "webhook_async", 1)
         await _set_priority(db_session, "fast_sync", 2)
 
-        resp = await client.post("/payments", json=payment_payload(), headers={"Idempotency-Key": "late-webhook-1"})
+        resp = await client.post("/payments", json=payment_payload(
+            provider_scenarios={"fast_sync": "success"}),
+            headers={"Idempotency-Key": "late-webhook-1"})
         payment_id = resp.json()["id"]
 
         body = await _wait_for_terminal_status(client, payment_id, timeout=2.0)

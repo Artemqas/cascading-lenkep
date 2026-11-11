@@ -2,16 +2,18 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import webhooks as webhooks_module
 from app.config import get_settings
 from app.enums import AttemptStatus, PaymentStatus
-from app.models import Payment, ProviderAttempt
+from app.models import Payment, ProviderAttempt, ReconciliationFlag
 from app.providers.base import AttemptOutcome, OutcomeKind, ProviderAttemptRequest
 from app.providers.registry import eligible_providers, get_adapter
 from app.reconciliation import resolve_ambiguous
 from app.routing import order_providers
-from app.stats import record_result
+from app.stats import correct_result, record_result
 from app.webhooks import send_merchant_webhook
 
 
@@ -104,3 +106,47 @@ async def finalize_failed(session: AsyncSession, payment: Payment, attempts: lis
     await session.commit()
     reasons = [a.decline_code for a in attempts if a.decline_code]
     await send_merchant_webhook(payment, "payment.failed", extra={"reasons": reasons})
+
+
+async def handle_late_resolution(
+    session: AsyncSession, attempt: ProviderAttempt, outcome: AttemptOutcome
+) -> None:
+    payment = await session.get(Payment, attempt.payment_id)
+
+    if outcome.kind != OutcomeKind.SUCCESS:
+        # A late (re-)confirmation of a decline. The cascade already counted this
+        # attempt as a failure when it moved past it, so there's nothing to correct.
+        return
+
+    result = await session.execute(
+        select(ProviderAttempt).where(
+            ProviderAttempt.payment_id == payment.id,
+            ProviderAttempt.status == AttemptStatus.SUCCEEDED,
+        )
+    )
+    succeeded_attempt = result.scalar_one_or_none()
+
+    if succeeded_attempt is not None and succeeded_attempt.id == attempt.id:
+        return  # duplicate webhook delivery for the attempt that already succeeded
+
+    # Either nothing succeeded yet (payment was finalized FAILED) or a *different*
+    # attempt succeeded — either way this late SUCCESS contradicts what the cascade
+    # already finalized.
+    payment.status = PaymentStatus.CONFLICT
+    attempt_ids = [str(attempt.id)]
+    if succeeded_attempt is not None:
+        attempt_ids.append(str(succeeded_attempt.id))
+    flag = ReconciliationFlag(
+        id=uuid.uuid4(),
+        payment_id=payment.id,
+        reason="late_success_after_finalization",
+        attempt_ids=attempt_ids,
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(flag)
+    await correct_result(session, attempt.provider_id, payment.direction, payment.card_type,
+                          old_success=False, new_success=True)
+    attempt.status = AttemptStatus.SUCCEEDED
+    attempt.resolved_at = datetime.now(timezone.utc)
+    await session.commit()
+    await webhooks_module.send_merchant_webhook(payment, "payment.conflict_detected")

@@ -18,6 +18,7 @@ class PaymentStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CONFLICT = "conflict"
+    REVIEW_REQUIRED = "review_required"
 
 
 class AttemptStatus(str, Enum):

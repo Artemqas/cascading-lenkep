@@ -36,6 +36,12 @@ class Payment(Base):
     provider_scenarios: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)
+    # Optimistic lock: the cascade loop and a provider webhook arriving on a
+    # separate session both read-then-write this row. Without a version check,
+    # whichever commits last silently wins instead of detecting the race.
+    version: Mapped[int] = mapped_column(default=1, nullable=False)
+
+    __mapper_args__ = {"version_id_col": version}
 
 
 class Provider(Base):

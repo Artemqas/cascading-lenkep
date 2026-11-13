@@ -22,16 +22,17 @@ flowchart TD
     F -->|declined_retryable| E
     F -->|ambiguous: timeout / 5xx / pending-webhook| I[resolve_ambiguous]
     I -->|resolved in time| F
-    I -->|deadline exceeded| J[mark attempt timed_out, record failure]
-    J --> E
+    I -->|deadline exceeded| J[mark attempt timed_out, stop cascading — outcome is unknown, not failed]
+    J --> R[payment.status=review_required, no further providers tried]
     G --> K[send_merchant_webhook: payment.succeeded]
     H --> L[send_merchant_webhook: payment.failed]
 
     M[POST /webhooks/providers/id] --> N{waiter registered?}
     N -->|yes, within deadline| I
     N -->|no — late or duplicate| O[handle_late_resolution]
-    O -->|matches already-finalized outcome| P[no-op]
-    O -->|contradicts finalized outcome| Q[payment.status=conflict + ReconciliationFlag + payment.conflict_detected webhook]
+    O -->|attempt already succeeded| P[no-op]
+    O -->|payment is review_required| S[log outcome on the attempt only — status untouched, human resolves]
+    O -->|contradicts an already-finalized outcome| Q[payment.status=conflict + ReconciliationFlag + payment.conflict_detected webhook]
 ```
 
 **Core pieces** (`app/`):
@@ -48,19 +49,36 @@ flowchart TD
   again everywhere. A `declined_retryable` outcome moves to the next provider. An
   `ambiguous` outcome is never treated as a failure outright: `reconciliation.py`
   either polls the provider's status-check endpoint or waits for its webhook, up to
-  a deadline, before the cascade is allowed to continue.
+  a deadline, before the cascade is allowed to continue. **If the deadline passes
+  with no answer, the cascade stops entirely** — `payment.status = review_required`,
+  no further provider is tried, and nothing resumes automatically. The provider's
+  real outcome is genuinely unknown at that point (not "probably failed"), and
+  trying another provider on an unconfirmed attempt is exactly how a double charge
+  happens. A human has to reconcile directly with the provider; there is no
+  background retry and no automatic resolution path (see Limitations).
 - `webhooks.py` — outgoing merchant webhooks (HMAC-signed, retried with backoff) and
   the in-process event bus that wakes up a waiting `reconciliation.resolve_ambiguous`
   call when a provider's webhook arrives in time.
 - `idempotency.py` — `Idempotency-Key` enforcement: same key + same payload replays
   the original payment; same key + a different payload is a `409`.
-- `handle_late_resolution` (in `cascade.py`) — the late/duplicate webhook path. If a
-  webhook arrives after the cascade already moved past that attempt, this is the
-  only place that can discover **two providers both reporting success for the same
-  payment**. It never silently picks one: it flags `payment.status = conflict`,
-  writes a `ReconciliationFlag`, and fires a dedicated `payment.conflict_detected`
-  webhook instead of touching the already-sent `payment.succeeded`/`payment.failed`
-  event.
+- `handle_late_resolution` (in `cascade.py`) — the late/duplicate webhook path.
+  - If the payment is already `review_required`, the webhook's outcome is logged
+    onto the `ProviderAttempt` (so the on-call engineer can see what the provider
+    actually said) but `payment.status` is never touched automatically — it stays
+    a human decision.
+  - Otherwise, if this late `SUCCESS` contradicts an outcome the cascade already
+    finalized (`succeeded`/`failed` via a *different* attempt), that's a genuine
+    conflict: it flags `payment.status = conflict`, writes a `ReconciliationFlag`,
+    and fires a dedicated `payment.conflict_detected` webhook instead of touching
+    the already-sent `payment.succeeded`/`payment.failed` event.
+- **Optimistic locking on `Payment`** — `finalize_success`, `finalize_failed`,
+  `mark_review_required`, and the conflict-flagging branch of
+  `handle_late_resolution` all read-then-write the same `Payment` row from
+  *different* sessions (the cascade's background task vs. an incoming provider
+  webhook request). `Payment.version` (SQLAlchemy `version_id_col`) makes a stale
+  write raise `StaleDataError` instead of silently overwriting a concurrent change;
+  `cascade._retry_on_stale_payment` catches it, re-reads the row, and re-decides
+  with fresh data instead of retrying blindly.
 
 ## Running it
 
@@ -149,12 +167,27 @@ curl -X POST localhost:8000/webhooks/providers/webhook_async \
   -d '{"attempt_id":"<id>","status":"approved"}'   # repeat -> still 200, no second webhook
 ```
 
-**Late webhook after the cascade already moved on flags a conflict:**
+**Ambiguous timeout stops the cascade for manual review — a late webhook only
+logs, it never auto-resolves:**
 
 ```bash
-# attempt already marked timed_out and superseded by a later provider's success
+# webhook_async never answers within the deadline: the cascade stops here,
+# fast_sync (next in line) is never tried, and the payment sits as review_required.
+# GET /payments/<id> shows status: "review_required", exactly one attempt.
 curl -X POST localhost:8000/webhooks/providers/webhook_async \
   -d '{"attempt_id":"<timed-out-attempt-id>","status":"approved"}'
+# GET /payments/<id> still shows status: "review_required" — the webhook is
+# recorded on the attempt (decline_code/provider_reference), but nothing
+# auto-finalizes; resolving it is a manual tool outside this API.
+```
+
+**Late webhook that genuinely contradicts an already-finalized payment still
+flags a conflict** (this is now the narrower case: the cascade finished via one
+provider, and a *different* attempt's late webhook disagrees with that):
+
+```bash
+curl -X POST localhost:8000/webhooks/providers/webhook_async \
+  -d '{"attempt_id":"<a-different-already-timed-out-attempt-id>","status":"approved"}'
 # GET /payments/<id> now shows status: "conflict"
 ```
 
@@ -171,6 +204,43 @@ curl -X POST localhost:8000/payments \
 
 ## Limitations / what I'd do differently with more time
 
+- **No manual-resolution tool.** A payment parked as `review_required` (or
+  `conflict`) stays there until someone changes it — there is deliberately no
+  endpoint for that in this API. Resolving it means talking to the provider
+  directly and then writing the correct status by hand (direct DB access/admin
+  tool, not built here); automating "what do we do once we know the truth" is a
+  business decision outside a 24h/short-cycle scope, same reasoning as the next
+  point.
+- **No automatic reversal on conflict.** When a late webhook reveals two providers
+  both reported success for the same payment, the system flags `status=conflict`
+  and stops — it does not attempt to automatically refund or reverse the duplicate.
+  That's a deliberate choice: reversal (especially for withdrawals, where money
+  already left to the end user) is a business/compliance decision, not something
+  safe to automate in a 24-hour scope.
+- **Real payment-domain gaps this project doesn't touch at all — named explicitly
+  here instead of silently assumed away:**
+  - **No PAN/token handling.** Only `card_bin` is stored. Routing a payment to a
+    *second* PSP on cascade requires either the raw PAN or a network/vault token
+    for that PSP — this project has neither, which means the cascade as built
+    couldn't actually retry on real providers without a tokenization vault and
+    PCI DSS scope (SAQ D at minimum) in front of it.
+  - **No 3DS.** Cascading after a 3DS challenge, liability-shift handling, and
+    soft-decline codes (e.g. `1A`) aren't modeled. A real second attempt after a
+    3DS-involved decline has different rules than a plain retry.
+  - **Decline codes are invented for the mocks**, not mapped to real scheme
+    taxonomies (Mastercard MAC, Visa's excessive-retry penalties/limits). The
+    `final` vs `retryable` classification is illustrative, not a real
+    scheme-compliant decision table.
+  - **Payouts (`withdraw`) run through the identical cascade as deposits.** This
+    release's fix (stop on unresolved-ambiguous instead of cascading) applies
+    equally to both directions, which does close the specific double-charge path
+    for payouts too — but a payout's risk profile is still otherwise unexamined:
+    money that already left to the end user is harder to claw back than a card
+    charge, and that asymmetry isn't reflected anywhere in routing or retry policy.
+  - **`card_bin` is stored but never read.** No BIN/geo-based routing, no
+    cost/fee-aware provider selection, no circuit breaker for a provider that's
+    currently failing, and `ProviderStats` has no time window or decay — a
+    provider's history from months ago weighs the same as yesterday's.
 - **No external task broker.** The cascade runs as an in-process `asyncio` task,
   not a Celery/RQ job. If the process restarts mid-cascade, that payment is stuck
   `pending`/`processing` forever — there's no crash recovery (an unexpected error

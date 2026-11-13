@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.exc import StaleDataError
 
 from app import webhooks as webhooks_module
 from app.config import Settings, get_settings
@@ -18,6 +19,8 @@ from app.stats import correct_result, record_result
 from app.webhooks import send_merchant_webhook
 
 logger = logging.getLogger(__name__)
+
+_MAX_VERSION_CONFLICT_RETRIES = 3
 
 
 def _build_request(attempt: ProviderAttempt, payment: Payment) -> ProviderAttemptRequest:
@@ -84,11 +87,17 @@ async def _run_cascade_loop(
                 str(attempt.id), outcome.provider_reference, adapter, settings.reconciliation_deadline_seconds
             )
             if resolved is None:
+                # The provider never confirmed or denied this attempt — its real
+                # outcome is unknown, not "probably failed". Trying the next
+                # provider here is exactly how a double charge happens. Stop and
+                # park the payment for a human to reconcile with the provider
+                # directly; stats stay untouched since we don't actually know
+                # whether this provider succeeded or failed.
                 attempt.status = AttemptStatus.TIMED_OUT
                 attempt.resolved_at = datetime.now(timezone.utc)
-                await record_result(session, provider.id, payment.direction, payment.card_type, success=False)
                 await session.commit()
-                continue
+                await mark_review_required(session, payment)
+                return
             outcome = resolved
 
         attempt.decline_code = outcome.decline_code
@@ -116,32 +125,91 @@ async def _run_cascade_loop(
     await finalize_failed(session, payment, attempts)
 
 
+async def _retry_on_stale_payment(session: AsyncSession, payment: Payment, mutate) -> bool:
+    """Reloads `payment`, calls `mutate(payment)` to decide-and-apply a change in
+    place (return True to commit, False to skip), and retries the whole
+    reread-decide-write cycle if a concurrent writer (the cascade vs. a late/
+    contradictory webhook, both targeting the same `Payment` row) commits first
+    and bumps `Payment.version` out from under us."""
+    for _ in range(_MAX_VERSION_CONFLICT_RETRIES):
+        await session.refresh(payment)
+        if not mutate(payment):
+            return False
+        try:
+            await session.commit()
+            return True
+        except StaleDataError:
+            await session.rollback()
+    raise RuntimeError(f"version conflict retries exhausted for payment {payment.id}")
+
+
 async def finalize_success(session: AsyncSession, payment: Payment, attempt: ProviderAttempt) -> None:
-    await session.refresh(payment)
-    if payment.status == PaymentStatus.CONFLICT:
-        # A late webhook already flagged a conflict on this payment (processed on
-        # a different session) while this cascade was still in flight — don't
-        # clobber that with a finalization decided before the conflict existed.
-        return
-    payment.status = PaymentStatus.SUCCEEDED
-    await session.commit()
-    await send_merchant_webhook(payment, "payment.succeeded")
+    def mutate(p: Payment) -> bool:
+        if p.status == PaymentStatus.CONFLICT:
+            # A late webhook already flagged a conflict on this payment (processed
+            # on a different session) while this cascade was still in flight —
+            # don't clobber that with a finalization decided before it existed.
+            return False
+        p.status = PaymentStatus.SUCCEEDED
+        return True
+
+    if await _retry_on_stale_payment(session, payment, mutate):
+        await send_merchant_webhook(payment, "payment.succeeded")
 
 
 async def finalize_failed(session: AsyncSession, payment: Payment, attempts: list[ProviderAttempt]) -> None:
-    await session.refresh(payment)
-    if payment.status == PaymentStatus.CONFLICT:
-        return
-    payment.status = PaymentStatus.FAILED
-    await session.commit()
-    reasons = [a.decline_code for a in attempts if a.decline_code]
-    await send_merchant_webhook(payment, "payment.failed", extra={"reasons": reasons})
+    def mutate(p: Payment) -> bool:
+        if p.status == PaymentStatus.CONFLICT:
+            return False
+        p.status = PaymentStatus.FAILED
+        return True
+
+    if await _retry_on_stale_payment(session, payment, mutate):
+        reasons = [a.decline_code for a in attempts if a.decline_code]
+        await send_merchant_webhook(payment, "payment.failed", extra={"reasons": reasons})
+
+
+async def mark_review_required(session: AsyncSession, payment: Payment) -> None:
+    def mutate(p: Payment) -> bool:
+        if p.status == PaymentStatus.CONFLICT:
+            return False
+        p.status = PaymentStatus.REVIEW_REQUIRED
+        return True
+
+    await _retry_on_stale_payment(session, payment, mutate)
+    logger.warning(
+        "payment %s parked for manual review: provider never confirmed or denied the attempt",
+        payment.id,
+    )
 
 
 async def handle_late_resolution(
     session: AsyncSession, attempt: ProviderAttempt, outcome: AttemptOutcome
 ) -> None:
+    if attempt.status == AttemptStatus.SUCCEEDED:
+        return  # duplicate webhook delivery for an attempt that already succeeded
+
     payment = await session.get(Payment, attempt.payment_id)
+    await session.refresh(payment)
+
+    if attempt.status in (AttemptStatus.AMBIGUOUS, AttemptStatus.TIMED_OUT) and payment.status in (
+        PaymentStatus.PROCESSING,
+        PaymentStatus.REVIEW_REQUIRED,
+    ):
+        # This is the attempt the cascade gave up waiting on (or is about to) and
+        # parked for manual review. Record what the provider actually said — a
+        # tech-support engineer needs this in the log to reconcile with the
+        # provider — but the payment's fate stays a human decision from here,
+        # never auto-applied.
+        attempt.decline_code = outcome.decline_code
+        attempt.provider_reference = outcome.provider_reference
+        attempt.resolved_at = datetime.now(timezone.utc)
+        logger.info(
+            "late webhook for review-required payment %s (attempt %s): %s",
+            payment.id, attempt.id, outcome.kind,
+        )
+        await session.commit()
+        return
 
     if outcome.kind != OutcomeKind.SUCCESS:
         # A late (re-)confirmation of a decline. The cascade already counted this
@@ -162,8 +230,13 @@ async def handle_late_resolution(
     # This attempt isn't among the succeeded ones — either nothing has succeeded
     # yet (payment was finalized FAILED) or a *different* attempt succeeded.
     # Either way this late SUCCESS contradicts what the cascade already finalized.
-    payment.status = PaymentStatus.CONFLICT
     attempt_ids = [str(attempt.id)] + [str(a.id) for a in succeeded_attempts]
+
+    def mutate(p: Payment) -> bool:
+        p.status = PaymentStatus.CONFLICT
+        return True
+
+    await _retry_on_stale_payment(session, payment, mutate)
     flag = ReconciliationFlag(
         id=uuid.uuid4(),
         payment_id=payment.id,

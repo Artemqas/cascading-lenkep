@@ -48,6 +48,24 @@ async def seed_timed_out_attempt(session, payment_id, *, provider_id):
     return attempt
 
 
+async def seed_review_required_payment_with_timed_out_attempt(session, *, provider_id):
+    payment = Payment(
+        direction=Direction.DEPOSIT, amount=1000, currency="USD", card_type=CardType.VISA,
+        status=PaymentStatus.REVIEW_REQUIRED, idempotency_key=str(uuid.uuid4()),
+        idempotency_payload_hash="h", callback_url="https://merchant.test/cb",
+    )
+    session.add(payment)
+    await session.flush()
+    attempt = ProviderAttempt(
+        id=uuid.uuid4(), payment_id=payment.id, provider_id=provider_id,
+        status=AttemptStatus.TIMED_OUT, requested_at=datetime.now(timezone.utc),
+        resolved_at=datetime.now(timezone.utc),
+    )
+    session.add(attempt)
+    await session.commit()
+    return payment, attempt
+
+
 async def load_reconciliation_flags(session, payment_id):
     result = await session.execute(
         select(ReconciliationFlag).where(ReconciliationFlag.payment_id == payment_id)
@@ -84,6 +102,48 @@ async def test_late_success_on_different_attempt_after_finalization_is_conflict(
     flags = await load_reconciliation_flags(db_session, payment.id)
     assert len(flags) == 1
     send_webhook_spy.assert_called_once_with(payment, "payment.conflict_detected")
+
+
+async def test_late_webhook_for_review_required_payment_logs_success_without_changing_status(
+    db_session, monkeypatch
+):
+    payment, attempt = await seed_review_required_payment_with_timed_out_attempt(
+        db_session, provider_id="webhook_async")
+    send_webhook_spy = AsyncMock()
+    monkeypatch.setattr("app.webhooks.send_merchant_webhook", send_webhook_spy)
+    correct_result_spy = AsyncMock()
+    monkeypatch.setattr("app.cascade.correct_result", correct_result_spy)
+
+    await handle_late_resolution(db_session, attempt, AttemptOutcome(kind=OutcomeKind.SUCCESS))
+
+    await db_session.refresh(payment)
+    await db_session.refresh(attempt)
+    assert payment.status == PaymentStatus.REVIEW_REQUIRED  # a human decides from here, not this call
+    assert attempt.decline_code is None
+    assert attempt.resolved_at is not None
+    send_webhook_spy.assert_not_called()
+    correct_result_spy.assert_not_called()
+    flags = await load_reconciliation_flags(db_session, payment.id)
+    assert flags == []
+
+
+async def test_late_webhook_for_review_required_payment_logs_decline_without_changing_status(
+    db_session, monkeypatch
+):
+    payment, attempt = await seed_review_required_payment_with_timed_out_attempt(
+        db_session, provider_id="webhook_async")
+    send_webhook_spy = AsyncMock()
+    monkeypatch.setattr("app.webhooks.send_merchant_webhook", send_webhook_spy)
+
+    await handle_late_resolution(
+        db_session, attempt, AttemptOutcome(kind=OutcomeKind.DECLINED_RETRYABLE, decline_code="processing_error")
+    )
+
+    await db_session.refresh(payment)
+    await db_session.refresh(attempt)
+    assert payment.status == PaymentStatus.REVIEW_REQUIRED
+    assert attempt.decline_code == "processing_error"
+    send_webhook_spy.assert_not_called()
 
 
 async def test_provider_webhook_endpoint_returns_200_even_for_unknown_attempt(client):

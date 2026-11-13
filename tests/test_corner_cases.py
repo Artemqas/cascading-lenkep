@@ -171,7 +171,13 @@ async def test_e2e_duplicate_webhook_delivery_is_noop(client, db_session, seed_p
     assert after.json()["status"] == "succeeded"
 
 
-async def test_e2e_late_webhook_after_cascade_moved_on_flags_conflict(client, db_session, seed_providers):
+async def test_e2e_ambiguous_timeout_parks_for_review_and_late_webhook_only_logs(
+    client, db_session, seed_providers
+):
+    # webhook_async never answers within the deadline. The old behavior cascaded
+    # on to fast_sync anyway — exactly how a double charge happens, since
+    # webhook_async's real outcome was never actually known. The fix: stop, park
+    # for manual review, and never auto-resolve from a webhook that shows up later.
     settings = get_settings()
     original_deadline = settings.reconciliation_deadline_seconds
     settings.reconciliation_deadline_seconds = 0.2
@@ -181,12 +187,14 @@ async def test_e2e_late_webhook_after_cascade_moved_on_flags_conflict(client, db
 
         resp = await client.post("/payments", json=payment_payload(
             provider_scenarios={"fast_sync": "success"}),
-            headers={"Idempotency-Key": "late-webhook-1"})
+            headers={"Idempotency-Key": "ambiguous-timeout-1"})
         payment_id = resp.json()["id"]
 
         body = await _wait_for_terminal_status(client, payment_id, timeout=2.0)
-        assert body["status"] == "succeeded"
-        timed_out_attempt = next(a for a in body["attempts"] if a["provider_id"] == "webhook_async")
+        assert body["status"] == "review_required"
+        assert len(body["attempts"]) == 1  # fast_sync was never tried
+        timed_out_attempt = body["attempts"][0]
+        assert timed_out_attempt["provider_id"] == "webhook_async"
         assert timed_out_attempt["status"] == "timed_out"
 
         late_payload = {"attempt_id": timed_out_attempt["id"], "status": "approved"}
@@ -194,7 +202,7 @@ async def test_e2e_late_webhook_after_cascade_moved_on_flags_conflict(client, db
         assert resp.status_code == 200
 
         final = await client.get(f"/payments/{payment_id}")
-        assert final.json()["status"] == "conflict"
+        assert final.json()["status"] == "review_required"  # still a human decision, not auto-resolved
     finally:
         settings.reconciliation_deadline_seconds = original_deadline
 
